@@ -51,8 +51,13 @@ def run():
         with torch.no_grad():
             torch.testing.assert_close(expected, restored.ground(restored.embed(pre, post, support), target)[0], atol=1e-6, rtol=1e-6)
         assert implementation.js_heatmap(logits, logits, torch.ones_like(logits)).abs().max() < 1e-7
-        sys.argv = ["effectafford", str(manifest), "--backbone", "cnn", "--classes", "2", "--epochs", "1", "--minimum-group", "1", "--output", str(work / "run")]
+        sys.argv = ["effectafford", str(manifest), "--backbone", "cnn", "--classes", "2", "--epochs", "2", "--batch-size", "6", "--warmup-epochs", "1", "--patience", "1", "--minimum-group", "1", "--output", str(work / "run")]
         implementation.main()
+        history = pd.read_csv(work / "run/history.csv")
+        assert {"validation_miou", "validation_retrieval_map", "selection_score", "backbone_lr", "head_lr"} <= set(history)
+        selected = torch.load(work / "run/model.pt", weights_only=True)
+        assert 1 <= selected["arguments"]["selected_epoch"] <= len(history)
+        assert len(implementation.sample_batch({0: {"a": [0], "b": [1], "c": [2]}, 1: {"d": [3], "e": [4], "f": [5]}}, np.random.default_rng(0), 64)) == 64
         metrics = json.loads((work / "run/metrics.json").read_text())
         assert {"iou", "pixel_ap", "pointing_game", "same_effect_retrieval_map", "effect_support_ece", "contact_hit_at_5"} <= metrics.keys()
         sys.argv = ["effectafford", str(manifest), "--checkpoint", str(work / "run/model.pt"), "--minimum-group", "1", "--output", str(work / "reload")]

@@ -10,7 +10,7 @@ Requires Python `>=3.11`. Run from the repository root in an activated environme
 python -m pip install -e .
 ```
 
-Functionality is checked on Python 3.13.5, PyTorch 2.7.1+cu118 (CPU) with `python smoke_check.py`. The generated-data check uses the explicit CNN control with eight-frame pre/post windows; it exercises NPZ/CSV loading, contrastive/grounding gradients and updates, one training epoch, calibration/evaluation, contact metrics, state reload and frozen-checkpoint evaluation. The pretrained ViT path, real video preprocessing and research performance have not been run here. `send2trash` is an optional check dependency, used to recycle generated inputs.
+Functionality is checked on Python 3.13.5, PyTorch 2.7.1+cu118 (CPU) with `python smoke_check.py`. The generated-data check uses the explicit CNN control with eight-frame pre/post windows; it exercises NPZ/CSV loading, contrastive/grounding gradients and updates, one training epoch, calibration/evaluation, contact metrics, state reload and frozen-checkpoint evaluation. A separate `python backbone_check.py` has also run the actual torchvision ImageNet-pretrained ViT-B/16 at 224x224, with finite nonzero backbone/head gradients and a real patch-weight update. Real video preprocessing and benchmark performance have not been run here. `send2trash` is an optional check dependency, used to recycle generated inputs.
 
 ## Data and preprocessing
 
@@ -62,7 +62,14 @@ effectafford data/interactions.csv --variant no_consistency --output outputs/no_
 | Actor/background consistency with excluded edit boundaries | `intervention`, `js_heatmap` | weight .15; valid support applied to cIoU and altered IoU |
 | mIoU/AP/PG/peak distance/retrieval, group probe, worst group, ECE/contact | `main` evaluation | `--minimum-group 25`, `--contact-radius .05` |
 
-The implementation uses mean-pooled window features and a compact 64-channel grounder; its topology is an explicit choice where the manuscript leaves dimensions unspecified. Two AdamW parameter groups use backbone LR 2e-5 and head LR 2e-4, weight decay .05. The current sampler forms three groups per effect per update and trains for the requested epochs; it does not yet implement the manuscript's batch-64 schedule, five-epoch warmup or early stopping on validation mIoU/retrieval. The actor/scene registration/tracking stage and external affordance baselines require their source pipelines and human-verified annotations. These commands do not reconstruct the original experiment evidence, and no paper scores are prefilled. Contact Hit/Proposal-Success additionally require the verified `contact` field.
+The implementation uses mean-pooled window features and a 64-channel grounder where the manuscript does not specify hidden dimensions. Training now uses 64 interactions per batch, guaranteeing three independent groups per effect before balanced filling. AdamW has backbone/head LR 2e-5/2e-4, weight decay .05, five-epoch warmup followed by cosine decay and 40 default epochs. CUDA uses AMP; ViT frames are chunked and activation-checkpointed, retaining backbone gradients without storing every frame's transformer activations. Set `--encoder-chunk-size` to fit available memory. Per-epoch validation computes mIoU and retrieval mAP against a training-only gallery, selects their unweighted mean, restores the best epoch and stops after `--patience 8` non-improving epochs (patience is an explicit setting absent from the manuscript). NPZ windows are read lazily with a bounded cache.
+
+Object/actor registration/tracking and external affordance baselines still require their original source pipelines and verified annotations. These commands do not recreate the original experiment evidence. Contact metrics additionally require verified `contact` fields.
+
+```bash
+effectafford data/interactions.csv --device cuda --batch-size 64 --warmup-epochs 5 --epochs 40 --patience 8 --output outputs/full
+python backbone_check.py
+```
 
 ```bash
 python -m pip install send2trash

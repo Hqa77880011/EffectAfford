@@ -1,5 +1,7 @@
 import argparse
 import json
+import math
+from functools import lru_cache
 import pickle
 from pathlib import Path
 
@@ -35,9 +37,10 @@ class ViTFeatures(torch.nn.Module):
 
 
 class EffectAfford(torch.nn.Module):
-    def __init__(self, classes, variant, backbone="cnn", pretrained=True):
+    def __init__(self, classes, variant, backbone="cnn", pretrained=True, encoder_chunk_size=16, checkpoint_encoder=True):
         super().__init__()
         self.variant = variant
+        self.encoder_chunk_size, self.checkpoint_encoder = encoder_chunk_size, checkpoint_encoder
         self.encoder = torch.nn.Sequential(torch.nn.Conv2d(3, 32, 5, stride=2, padding=2), torch.nn.ReLU(), torch.nn.Conv2d(32, 64, 3, stride=2, padding=1), torch.nn.ReLU(), torch.nn.Conv2d(64, 64, 3, padding=1), torch.nn.ReLU())
         if backbone == "vit_b_16":
             self.encoder = ViTFeatures(pretrained)
@@ -49,12 +52,20 @@ class EffectAfford(torch.nn.Module):
         self.classify = torch.nn.Linear(64, classes)
 
     def encode_window(self, frames):
-        """Average features over observed pre/post frames, preserving spatial support."""
-        if frames.ndim == 5:
+        """Mean pool observed frames; chunk/checkpoint ViT activations for batch64."""
+        temporal = frames.ndim == 5
+        if temporal:
             n, time, channels, height, width = frames.shape
-            feature = self.encoder(frames.reshape(n * time, channels, height, width))
-            return feature.reshape(n, time, *feature.shape[1:]).mean(1)
-        return self.encoder(frames)
+            frames = frames.reshape(n * time, channels, height, width)
+        features = []
+        for chunk in frames.split(self.encoder_chunk_size):
+            if self.training and self.checkpoint_encoder and isinstance(self.encoder, ViTFeatures):
+                from torch.utils.checkpoint import checkpoint
+                features.append(checkpoint(self.encoder, chunk, use_reentrant=False))
+            else:
+                features.append(self.encoder(chunk))
+        feature = torch.cat(features)
+        return feature.reshape(n, time, *feature.shape[1:]).mean(1) if temporal else feature
 
     def embed(self, pre, post, support):
         before, after = self.encode_window(pre), self.encode_window(post)
@@ -67,7 +78,7 @@ class EffectAfford(torch.nn.Module):
         return torch.nn.functional.normalize(pooled, dim=1)
 
     def ground(self, z, target):
-        feature = self.encoder(target)
+        feature = self.encode_window(target)
         b, d, h, w = feature.shape
         association = torch.einsum("bd,bdhw->bhw", self.query(z), self.key(feature)) / np.sqrt(d)
         attention = torch.softmax(association.flatten(1), dim=1).reshape(b, 1, h, w)
@@ -140,12 +151,72 @@ def contrastive(z, labels, groups, verbs, variant):
     return torch.stack(losses).mean() if losses else zero, torch.stack(hard).mean() if hard else zero
 
 
+def sample_batch(effect_groups, rng, count):
+    """Guarantee two cross-group positives per anchor before filling a balanced batch."""
+    if count < 3 * len(effect_groups):
+        raise ValueError("batch_size must hold three independent groups per effect")
+    identities = []
+    effects = list(effect_groups)
+    for groups in effect_groups.values():
+        for group in rng.choice(list(groups), 3, replace=False):
+            identities.append(int(rng.choice(groups[group])))
+    while len(identities) < count:
+        groups = effect_groups[effects[len(identities) % len(effects)]]
+        group = rng.choice(list(groups))
+        identities.append(int(rng.choice(groups[group])))
+    rng.shuffle(identities)
+    return identities
+
+
+def validation_measure(model, records, get_record, device):
+    """Mean validation mIoU/retrieval mAP; no test record enters model selection."""
+    model.eval()
+    gallery, queries = [], []
+    with torch.no_grad():
+        for index, metadata in enumerate(records):
+            if metadata["split"] not in {"train", "val"}:
+                continue
+            record = get_record(index)
+            pre, post, target, support, truth = [value.to(device) for value in batch([record])]
+            z = model.embed(pre, post, support)
+            item = dict(embedding=z[0].cpu().numpy(), effect=record["effect"], group=record["group"])
+            if metadata["split"] == "train":
+                gallery.append(item)
+            else:
+                item.update(probability=model.ground(z, target)[0].sigmoid()[0, 0].cpu().numpy(), truth=record["region"].astype(bool), supports=record["supports"])
+                queries.append(item)
+    retrieval = []
+    for query in queries:
+        candidates = [item for item in gallery if item["group"] != query["group"]]
+        truth = np.array([item["effect"] == query["effect"] for item in candidates])
+        if truth.any():
+            retrieval.append(average_precision_score(truth, [query["embedding"] @ item["embedding"] for item in candidates]))
+    thresholds = np.linspace(.05, .95, 37)
+    values = []
+    for threshold in thresholds:
+        overlap = []
+        for query in queries:
+            if not query["supports"]:
+                continue
+            predicted = query["probability"] > threshold
+            overlap.append(np.sum(predicted & query["truth"]) / max(1, np.sum(predicted | query["truth"])))
+        values.append(float(np.mean(overlap)) if overlap else 0.)
+    miou, retrieval_map = max(values), float(np.mean(retrieval)) if retrieval else 0.
+    return .5 * (miou + retrieval_map), miou, retrieval_map
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("manifest")
     p.add_argument("--output", default="outputs/full")
     p.add_argument("--classes", type=int, default=8)
-    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--warmup-epochs", type=int, default=5)
+    p.add_argument("--patience", type=int, default=8)
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--encoder-chunk-size", type=int, default=16)
+    p.add_argument("--checkpoint-encoder", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--minimum-group", type=int, default=25)
     p.add_argument("--contact-radius", type=float, default=.05)
     p.add_argument("--variant", choices=["full", "appearance_only", "no_equivalence", "no_hard", "no_crossverb", "no_consistency"], default="full")
@@ -160,20 +231,24 @@ def main():
     if manifest.groupby("group").split.nunique().max() != 1:
         raise ValueError("Actor/scene groups must not cross splits")
     manifest["path"] = manifest["path"].map(lambda value: str(Path(args.manifest).resolve().parent / value))
-    records = [dict(load_record(row.path), **row._asdict()) for row in manifest.itertuples(index=False)]
+    records = [row._asdict() for row in manifest.itertuples(index=False)]
+    @lru_cache(maxsize=2 * args.batch_size)
+    def get_record(index):
+        return dict(load_record(records[index]["path"]), **records[index])
     training = [i for i, r in enumerate(records) if r["split"] == "train"]
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    checkpoint = torch.load(args.checkpoint, weights_only=True) if args.checkpoint else None
+    checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=True) if args.checkpoint else None
     if checkpoint:
         saved = checkpoint["arguments"]
         args.classes, args.variant, args.backbone = saved["classes"], saved["variant"], saved.get("backbone", "cnn")
-    model = EffectAfford(args.classes, args.variant, args.backbone, pretrained=checkpoint is None)
+    model = EffectAfford(args.classes, args.variant, args.backbone, pretrained=checkpoint is None, encoder_chunk_size=args.encoder_chunk_size, checkpoint_encoder=args.checkpoint_encoder).to(args.device)
     if checkpoint:
         model.load_state_dict(checkpoint["state"])
     encoder_parameters = list(model.encoder.parameters())
     encoder_ids = {id(parameter) for parameter in encoder_parameters}
     optimizer = torch.optim.AdamW([{"params": encoder_parameters, "lr": 2e-5}, {"params": [parameter for parameter in model.parameters() if id(parameter) not in encoder_ids], "lr": 2e-4}], weight_decay=.05)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.device.startswith("cuda"))
     effect_groups = {}
     for i in training:
         effect_groups.setdefault(records[i]["effect"], {}).setdefault(str(records[i]["group"]), []).append(i)
@@ -188,65 +263,81 @@ def main():
         if not options:
             raise ValueError("Each split needs at least two groups for background interventions")
         donors[i] = options[0]
-    history = []
+    history, best_score, best_state, stale = [], -float("inf"), None, 0
     for epoch in range(0 if checkpoint else args.epochs):
+        model.train()
+        factor = (epoch + 1) / args.warmup_epochs if epoch < args.warmup_epochs else .5 * (1 + math.cos(math.pi * (epoch + 1 - args.warmup_epochs) / max(1, args.epochs - args.warmup_epochs)))
+        for group, peak in zip(optimizer.param_groups, [2e-5, 2e-4]):
+            group["lr"] = peak * factor
         epoch_losses = []
-        for _ in range(max(1, len(training) // (3 * len(effect_groups)))):
-            ids = []
-            for groups in effect_groups.values():
-                for group in rng.choice(list(groups), 3, replace=False):
-                    ids.append(int(rng.choice(groups[group])))
-            chosen = [records[i] for i in ids]
-            pre, post, target, support, truth = batch(chosen)
-            z = model.embed(pre, post, support)
-            logits, confidence = model.ground(z, target)
-            probability = logits.sigmoid()
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, truth)
-            loss += 1 - (2 * (probability * truth).sum() + 1) / (probability.sum() + truth.sum() + 1)
-            edge_target = torch.tensor(np.stack([cv2.morphologyEx(r["region"].astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) for r in chosen]), dtype=torch.float32)[:, None]
-            edge_prediction = torch.nn.functional.max_pool2d(probability, 3, 1, 1) + torch.nn.functional.max_pool2d(-probability, 3, 1, 1)
-            loss += .25 * torch.nn.functional.l1_loss(edge_prediction, edge_target)
-            labels = np.array([r["effect"] for r in chosen])
-            groups = np.array([r["group"] for r in chosen])
-            verbs = np.array([r["verb"] for r in chosen])
-            eq, hard = contrastive(z, labels, groups, verbs, args.variant)
-            if args.variant != "no_equivalence":
-                loss += .2 * eq
-            if args.variant != "no_hard":
-                loss += .1 * hard
-            binary = torch.tensor([r["supports"] for r in chosen], dtype=torch.float32)
-            loss += .5 * (torch.nn.functional.binary_cross_entropy_with_logits(confidence, binary) + torch.nn.functional.cross_entropy(model.classify(z), torch.tensor(labels, dtype=torch.long)))
-            if args.variant != "no_consistency":
-                for kind in ("actor", "background"):
-                    altered = [intervention(records[i], records[donors[i]], kind) for i in ids]
-                    modified, modified_confidence = model.ground(z, image_tensor([r[0] for r in altered]))
-                    valid = torch.tensor(np.stack([r[1] for r in altered]), dtype=torch.float32)[:, None]
-                    allowed = (valid.sum((1, 2, 3)) > 0).float()
-                    loss += .15 * (js_heatmap(logits, modified, valid).mean() + ((confidence.sigmoid() - modified_confidence.sigmoid()).abs() * allowed).sum() / allowed.sum().clamp_min(1))
+        for _ in range(max(1, math.ceil(len(training) / args.batch_size))):
+            ids = sample_batch(effect_groups, rng, args.batch_size)
+            chosen = [get_record(i) for i in ids]
+            pre, post, target, support, truth = [value.to(args.device) for value in batch(chosen)]
+            with torch.amp.autocast(device_type="cuda", enabled=args.device.startswith("cuda")):
+                z = model.embed(pre, post, support)
+                logits, confidence = model.ground(z, target)
+                probability = logits.sigmoid()
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, truth)
+                loss += 1 - (2 * (probability * truth).sum() + 1) / (probability.sum() + truth.sum() + 1)
+                edge_target = torch.tensor(np.stack([cv2.morphologyEx(r["region"].astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) for r in chosen]), dtype=torch.float32, device=args.device)[:, None]
+                edge_prediction = torch.nn.functional.max_pool2d(probability, 3, 1, 1) + torch.nn.functional.max_pool2d(-probability, 3, 1, 1)
+                loss += .25 * torch.nn.functional.l1_loss(edge_prediction, edge_target)
+                labels = np.array([r["effect"] for r in chosen])
+                groups = np.array([r["group"] for r in chosen])
+                verbs = np.array([r["verb"] for r in chosen])
+                eq, hard = contrastive(z, labels, groups, verbs, args.variant)
+                if args.variant != "no_equivalence":
+                    loss += .2 * eq
+                if args.variant != "no_hard":
+                    loss += .1 * hard
+                binary = torch.tensor([r["supports"] for r in chosen], dtype=torch.float32, device=args.device)
+                loss += .5 * (torch.nn.functional.binary_cross_entropy_with_logits(confidence, binary) + torch.nn.functional.cross_entropy(model.classify(z), torch.tensor(labels, dtype=torch.long, device=args.device)))
+                if args.variant != "no_consistency":
+                    for kind in ("actor", "background"):
+                        altered = [intervention(get_record(i), get_record(donors[i]), kind) for i in ids]
+                        modified, modified_confidence = model.ground(z, image_tensor([r[0] for r in altered]).to(args.device))
+                        valid = torch.tensor(np.stack([r[1] for r in altered]), dtype=torch.float32, device=args.device)[:, None]
+                        allowed = (valid.sum((1, 2, 3)) > 0).float()
+                        loss += .15 * (js_heatmap(logits, modified, valid).mean() + ((confidence.sigmoid() - modified_confidence.sigmoid()).abs() * allowed).sum() / allowed.sum().clamp_min(1))
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite effect-affordance objective")
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             epoch_losses.append(float(loss.detach()))
-        history.append(dict(epoch=epoch, loss=float(np.mean(epoch_losses))))
+        score, miou, retrieval_map = validation_measure(model, records, get_record, args.device)
+        history.append(dict(epoch=epoch + 1, loss=float(np.mean(epoch_losses)), validation_miou=miou, validation_retrieval_map=retrieval_map, selection_score=score, backbone_lr=optimizer.param_groups[0]["lr"], head_lr=optimizer.param_groups[1]["lr"]))
+        if score > best_score:
+            best_score, stale = score, 0
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            args.selected_epoch = epoch + 1
+        else:
+            stale += 1
+        if stale >= args.patience:
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        del best_state
     model.eval()
     results = []
     with torch.no_grad():
-        for i, r in enumerate(records):
-            pre, post, target, support, truth = batch([r])
+        for i, metadata in enumerate(records):
+            r = get_record(i)
+            pre, post, target, support, truth = [value.to(args.device) for value in batch([r])]
             z = model.embed(pre, post, support)
             logits, confidence = model.ground(z, target)
             altered = {}
             for kind in ("actor", "background"):
-                image, valid = intervention(r, records[donors[i]], kind)
-                pred, _ = model.ground(z, image_tensor([image]))
-                altered[kind] = {"probability": pred.sigmoid()[0, 0].numpy(), "valid": valid.astype(bool)} if valid.any() else None
-            results.append(dict(index=i, embedding=z[0].numpy(), probability=logits.sigmoid()[0, 0].numpy(), support_logit=float(confidence), effect_prediction=int(model.classify(z).argmax()), **altered))
+                image, valid = intervention(r, get_record(donors[i]), kind)
+                pred, _ = model.ground(z, image_tensor([image]).to(args.device))
+                altered[kind] = {"probability": pred.sigmoid()[0, 0].cpu().numpy(), "valid": valid.astype(bool)} if valid.any() else None
+            results.append(dict(index=i, embedding=z[0].cpu().numpy(), probability=logits.sigmoid()[0, 0].cpu().numpy(), support_logit=float(confidence), effect_prediction=int(model.classify(z).argmax()), **altered))
     val = [r for r in results if records[r["index"]]["split"] == "val"]
     def iou(pred, truth):
         return float(np.sum(pred & truth) / max(1, np.sum(pred | truth)))
-    threshold = checkpoint["threshold"] if checkpoint else float(max(np.linspace(.05, .95, 37), key=lambda t: np.mean([iou(r["probability"] > t, records[r["index"]]["region"].astype(bool)) for r in val])))
+    threshold = checkpoint["threshold"] if checkpoint else float(max(np.linspace(.05, .95, 37), key=lambda t: np.mean([iou(r["probability"] > t, get_record(r["index"])["region"].astype(bool)) for r in val])))
     def temperature_loss(log_temperature):
         x = torch.tensor([r["support_logit"] for r in val]) / np.exp(log_temperature)
         y = torch.tensor([records[r["index"]]["supports"] for r in val], dtype=torch.float32)
@@ -261,7 +352,7 @@ def main():
     rows = []
     retrieval = []
     for result in results:
-        r = records[result["index"]]
+        r = get_record(result["index"])
         if r["split"] != "test":
             continue
         if args.test_domain is not None and r.get("domain") != args.test_domain:
