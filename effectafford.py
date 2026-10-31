@@ -16,11 +16,31 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, balanced_accuracy_score, f1_score
 
 
+class ViTFeatures(torch.nn.Module):
+    """Expose the pretrained ViT-B/16 patch grid before its classification head."""
+    def __init__(self, pretrained=True):
+        super().__init__()
+        from torchvision.models import ViT_B_16_Weights, vit_b_16
+        self.vit = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1 if pretrained else None)
+        self.vit.heads = torch.nn.Identity()
+        self.projection = torch.nn.Conv2d(768, 64, 1)
+
+    def forward(self, x):
+        x = torch.nn.functional.interpolate(x, (224, 224), mode="bilinear", align_corners=False)
+        x = (x - x.new_tensor([.485, .456, .406])[None, :, None, None]) / x.new_tensor([.229, .224, .225])[None, :, None, None]
+        tokens = self.vit.conv_proj(x).flatten(2).transpose(1, 2)
+        tokens = torch.cat([self.vit.class_token.expand(len(x), -1, -1), tokens], dim=1)
+        tokens = self.vit.encoder(tokens)[:, 1:]
+        return self.projection(tokens.transpose(1, 2).reshape(len(x), 768, 14, 14))
+
+
 class EffectAfford(torch.nn.Module):
-    def __init__(self, classes, variant):
+    def __init__(self, classes, variant, backbone="cnn", pretrained=True):
         super().__init__()
         self.variant = variant
         self.encoder = torch.nn.Sequential(torch.nn.Conv2d(3, 32, 5, stride=2, padding=2), torch.nn.ReLU(), torch.nn.Conv2d(32, 64, 3, stride=2, padding=1), torch.nn.ReLU(), torch.nn.Conv2d(64, 64, 3, padding=1), torch.nn.ReLU())
+        if backbone == "vit_b_16":
+            self.encoder = ViTFeatures(pretrained)
         self.change = torch.nn.Sequential(torch.nn.Conv2d(256, 64, 1), torch.nn.GroupNorm(8, 64), torch.nn.ReLU(), torch.nn.Conv2d(64, 64, 1))
         self.query = torch.nn.Linear(64, 64)
         self.key = torch.nn.Conv2d(64, 64, 1)
@@ -28,8 +48,16 @@ class EffectAfford(torch.nn.Module):
         self.support = torch.nn.Linear(128, 1)
         self.classify = torch.nn.Linear(64, classes)
 
+    def encode_window(self, frames):
+        """Average features over observed pre/post frames, preserving spatial support."""
+        if frames.ndim == 5:
+            n, time, channels, height, width = frames.shape
+            feature = self.encoder(frames.reshape(n * time, channels, height, width))
+            return feature.reshape(n, time, *feature.shape[1:]).mean(1)
+        return self.encoder(frames)
+
     def embed(self, pre, post, support):
-        before, after = self.encoder(pre), self.encoder(post)
+        before, after = self.encode_window(pre), self.encode_window(post)
         if self.variant == "appearance_only":
             after = before
         difference = after - before
@@ -57,7 +85,9 @@ def load_record(path):
 
 
 def image_tensor(images):
-    return torch.tensor(np.stack(images).transpose(0, 3, 1, 2), dtype=torch.float32) / 255
+    images = np.stack(images)
+    order = (0, 1, 4, 2, 3) if images.ndim == 5 else (0, 3, 1, 2)
+    return torch.tensor(images.transpose(*order), dtype=torch.float32) / 255
 
 
 def batch(records):
@@ -101,8 +131,8 @@ def contrastive(z, labels, groups, verbs, variant):
         positive_ids = np.where(positives)[0]
         if not len(positive_ids):
             continue
-        denominator = torch.logsumexp(torch.cat([similarity[i, :i], similarity[i, i + 1:]]) / .1, dim=0)
-        losses.append(-(similarity[i, positive_ids] / .1 - denominator).mean())
+        denominator = torch.logsumexp(torch.cat([similarity[i, :i], similarity[i, i + 1:]]) / .07, dim=0)
+        losses.append(-(similarity[i, positive_ids] / .07 - denominator).mean())
         negative_ids = np.where((verbs == verbs[i]) & (labels != labels[i]))[0]
         if len(negative_ids):
             hard.append(torch.relu(.2 + similarity[i, negative_ids].max() - similarity[i, positive_ids].min()))
@@ -121,18 +151,29 @@ def main():
     p.add_argument("--variant", choices=["full", "appearance_only", "no_equivalence", "no_hard", "no_crossverb", "no_consistency"], default="full")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--test-domain")
+    p.add_argument("--backbone", choices=["vit_b_16", "cnn"], default="vit_b_16")
+    p.add_argument("--checkpoint", help="Evaluate a saved model without fitting parameters, threshold or temperature")
     args = p.parse_args()
     manifest = pd.read_csv(args.manifest)
     if not all((manifest.split == s).any() for s in ("train", "val", "test")):
         raise ValueError("Provide independent train, val and test interactions")
     if manifest.groupby("group").split.nunique().max() != 1:
         raise ValueError("Actor/scene groups must not cross splits")
+    manifest["path"] = manifest["path"].map(lambda value: str(Path(args.manifest).resolve().parent / value))
     records = [dict(load_record(row.path), **row._asdict()) for row in manifest.itertuples(index=False)]
     training = [i for i, r in enumerate(records) if r["split"] == "train"]
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    model = EffectAfford(args.classes, args.variant)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=.0003, weight_decay=.0001)
+    checkpoint = torch.load(args.checkpoint, weights_only=True) if args.checkpoint else None
+    if checkpoint:
+        saved = checkpoint["arguments"]
+        args.classes, args.variant, args.backbone = saved["classes"], saved["variant"], saved.get("backbone", "cnn")
+    model = EffectAfford(args.classes, args.variant, args.backbone, pretrained=checkpoint is None)
+    if checkpoint:
+        model.load_state_dict(checkpoint["state"])
+    encoder_parameters = list(model.encoder.parameters())
+    encoder_ids = {id(parameter) for parameter in encoder_parameters}
+    optimizer = torch.optim.AdamW([{"params": encoder_parameters, "lr": 2e-5}, {"params": [parameter for parameter in model.parameters() if id(parameter) not in encoder_ids], "lr": 2e-4}], weight_decay=.05)
     effect_groups = {}
     for i in training:
         effect_groups.setdefault(records[i]["effect"], {}).setdefault(str(records[i]["group"]), []).append(i)
@@ -148,7 +189,7 @@ def main():
             raise ValueError("Each split needs at least two groups for background interventions")
         donors[i] = options[0]
     history = []
-    for epoch in range(args.epochs):
+    for epoch in range(0 if checkpoint else args.epochs):
         epoch_losses = []
         for _ in range(max(1, len(training) // (3 * len(effect_groups)))):
             ids = []
@@ -182,6 +223,8 @@ def main():
                     valid = torch.tensor(np.stack([r[1] for r in altered]), dtype=torch.float32)[:, None]
                     allowed = (valid.sum((1, 2, 3)) > 0).float()
                     loss += .15 * (js_heatmap(logits, modified, valid).mean() + ((confidence.sigmoid() - modified_confidence.sigmoid()).abs() * allowed).sum() / allowed.sum().clamp_min(1))
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite effect-affordance objective")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -198,19 +241,23 @@ def main():
             for kind in ("actor", "background"):
                 image, valid = intervention(r, records[donors[i]], kind)
                 pred, _ = model.ground(z, image_tensor([image]))
-                altered[kind] = pred.sigmoid()[0, 0].numpy() if valid.any() else None
+                altered[kind] = {"probability": pred.sigmoid()[0, 0].numpy(), "valid": valid.astype(bool)} if valid.any() else None
             results.append(dict(index=i, embedding=z[0].numpy(), probability=logits.sigmoid()[0, 0].numpy(), support_logit=float(confidence), effect_prediction=int(model.classify(z).argmax()), **altered))
     val = [r for r in results if records[r["index"]]["split"] == "val"]
     def iou(pred, truth):
         return float(np.sum(pred & truth) / max(1, np.sum(pred | truth)))
-    threshold = float(max(np.linspace(.05, .95, 37), key=lambda t: np.mean([iou(r["probability"] > t, records[r["index"]]["region"].astype(bool)) for r in val])))
+    threshold = checkpoint["threshold"] if checkpoint else float(max(np.linspace(.05, .95, 37), key=lambda t: np.mean([iou(r["probability"] > t, records[r["index"]]["region"].astype(bool)) for r in val])))
     def temperature_loss(log_temperature):
         x = torch.tensor([r["support_logit"] for r in val]) / np.exp(log_temperature)
         y = torch.tensor([records[r["index"]]["supports"] for r in val], dtype=torch.float32)
         return float(torch.nn.functional.binary_cross_entropy_with_logits(x, y))
-    temperature = float(np.exp(minimize_scalar(temperature_loss, bounds=(-3, 3), method="bounded").x))
+    temperature = checkpoint["temperature"] if checkpoint else float(np.exp(minimize_scalar(temperature_loss, bounds=(-3, 3), method="bounded").x))
     train_results = [r for r in results if records[r["index"]]["split"] == "train"]
-    probe = LogisticRegression(max_iter=1000).fit(np.stack([r["embedding"] for r in train_results]), [records[r["index"]]["participant_group"] for r in train_results])
+    if checkpoint:
+        with (Path(args.checkpoint).parent / "actor_probe.pkl").open("rb") as handle:
+            probe = pickle.load(handle)
+    else:
+        probe = LogisticRegression(max_iter=1000).fit(np.stack([r["embedding"] for r in train_results]), [records[r["index"]]["participant_group"] for r in train_results])
     rows = []
     retrieval = []
     for result in results:
@@ -232,8 +279,8 @@ def main():
         row = dict(id=str(r["id"]), effect=int(r["effect"]), group=str(r["group"]), domain=r.get("domain", "default"), iou=iou(pred, truth), pixel_ap=float(average_precision_score(truth.ravel(), heatmap.ravel())) if truth.any() else None, pointing_game=bool(truth[maximum]), normalized_peak_distance=distance, effect_prediction=result["effect_prediction"], support_probability=support_probability, supports=int(r["supports"]), participant_group=r["participant_group"], actor_probe=actor_prediction.item() if hasattr(actor_prediction, "item") else actor_prediction)
         for kind in ("actor", "background"):
             altered = result[kind]
-            row[f"{kind}_ciou"] = iou(pred, altered > threshold) if altered is not None else None
-            row[f"{kind}_iou"] = iou(altered > threshold, truth) if altered is not None else None
+            row[f"{kind}_ciou"] = iou(pred[altered["valid"]], (altered["probability"] > threshold)[altered["valid"]]) if altered is not None else None
+            row[f"{kind}_iou"] = iou((altered["probability"] > threshold)[altered["valid"]], truth[altered["valid"]]) if altered is not None else None
         candidates = [g for g in train_results if records[g["index"]]["group"] != r["group"]]
         similarities = np.array([result["embedding"] @ g["embedding"] for g in candidates])
         relevant = np.array([records[g["index"]]["effect"] == r["effect"] for g in candidates])
@@ -284,6 +331,7 @@ def main():
     plt.ylabel("Effect-conditioned IoU")
     plt.tight_layout()
     plt.savefig(out / "effects.png", dpi=180)
+    plt.close()
 
 
 if __name__ == "__main__":
